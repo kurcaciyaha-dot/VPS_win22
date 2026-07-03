@@ -1,0 +1,120 @@
+name: RDP-Windows2022-Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Mengaktifkan Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+
+          # Mengonfigurasi Firewall secara aman untuk RDP via PowerShell
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
+
+          # Restart Service agar konfigurasi baru aktif
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -Description "Tailscale RDP User"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          # FIX BUG: Menggunakan Out-File UTF8 agar GITHUB_ENV terbaca dengan benar oleh GitHub Actions di Windows
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          
+          if (-not (Get-LocalUser -Name "RDPUser")) {
+              Write-Error "Gagal membuat user baru."
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Berikan jeda 5 detik agar service Tailscale selesai inisialisasi di latar belakang
+          Start-Sleep -Seconds 5
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Menghubungkan ke Tailscale menggunakan Auth Key
+          # Ditambahkan --ephemeral agar runner otomatis terhapus dari dashboard Tailscale saat selesai
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-windows2022-${{ github.run_id }} --ephemeral=true --accept-dns=false
+          
+          # Menunggu hingga IP didapatkan
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale gagal mendapatkan IP address."
+              exit 1
+          }
+          
+          # FIX BUG: Simpan IP ke GITHUB_ENV dengan encoding yang benar
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify RDP Accessibility
+        run: |
+          $ip = $env:TAILSCALE_IP
+          Write-Host "Memverifikasi RDP pada IP: $ip"
+          
+          $testResult = Test-NetConnection -ComputerName $ip -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "Koneksi RDP internal via Port 3389 gagal!"
+              exit 1
+          }
+          Write-Host "Koneksi RDP Aktif dan Siap Digunakan!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=========================================="
+          Write-Host " KONEKSI RDP BERHASIL DIAKTIFKAN"
+          Write-Host "=========================================="
+          Write-Host "IP Address : $env:TAILSCALE_IP"
+          Write-Host "Username   : RDPUser"
+          Write-Host "Password   : $env:RDP_PASS"
+          Write-Host "=========================================="
+          Write-Host "Gunakan aplikasi Remote Desktop (RDP) di PC Anda"
+          Write-Host "lalu masukkan detail di atas."
+          Write-Host "Tekan 'Cancel' pada Workflow GitHub untuk berhenti.`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] Runner Tetap Aktif..."
+              Start-Sleep -Seconds 180
+          }
